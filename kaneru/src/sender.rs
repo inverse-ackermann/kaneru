@@ -1,0 +1,62 @@
+use std::{
+    cell::UnsafeCell,  
+};
+
+use xdpilone::{
+    Umem,
+    BufIdx, 
+    DeviceQueue,
+    RingTx,
+    xdp::XdpDesc,
+};
+
+pub fn sender(umem: Umem, tx: &mut RingTx) {    
+    // actually though
+    // for inexplicable reasons the author of xdpilone decided that the fill and completion rings
+    // should only be accessed through a shared structure DeviceQueue
+    let mut tx_frame = umem.frame(BufIdx(0)).unwrap();
+    unsafe {
+        tx_frame.addr.as_mut()[..54].copy_from_slice(&SYN_PACKET[..]);
+    }
+    {
+        let mut writer = tx.transmit(1);
+        writer.insert_once(XdpDesc { 
+            addr: tx_frame.offset,
+            len: 54,
+            options: 0,
+        });
+        writer.commit();
+    }
+
+    if tx.needs_wakeup() {
+        tx.wake();
+    }
+}
+
+static OLD_SYN_PACKET: [u8; 54] = [
+    // ETHER
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // (dst mac) [0..6]
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // (src mac) [6..12]
+    0x08, 0x00, // proto
+    
+    // IP
+    0x45, 0x00, 0x00, 0x28, // version etc 
+    0x00, 0x01, 0x00, 0x00, // more irrelevant stuff
+    0xff, 0x06, // ttl, protocol
+    0xbd, 0xcc, // [checksum] [25..27]
+    127, 0, 0, 1, // (src ip) [27..31]
+    127, 0, 0, 1, // [dst ip] []
+
+    // TCP
+    0x05, 0x39, // source port known statically as 1337
+    0x07, 0xd0, // [dst port]
+    0x00, 0x00, 0x00, 0x00, // sequence number
+    0x00, 0x00, 0x00, 0x00, // acknowledgment number
+    0x50, // data offset
+    0b00000010, // flags = SYN
+    0x20, 0x00, // window size
+    0x70, 0x04, // [checksum]
+    0x00, 0x00, // urgent pointer
+];
+
+static SYN_PACKET: [u8; 54] = [0x60, 0x3e, 0x5f, 0x86, 0x1e, 0x94, 0x38, 0xba, 0xf8, 0x7b, 0xda, 0x40, 0x08, 0x00, 0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 0xff, 0x06, 0xfb, 0xa2, 0xc0, 0xa8, 0x1f, 0x66, 0xc0, 0xa8, 0x1f, 0x75, 0x05, 0x39, 0x1c, 0xa3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0x20, 0x00, 0xad, 0xda, 0x00, 0x00];
