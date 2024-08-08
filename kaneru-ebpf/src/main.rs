@@ -46,7 +46,7 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
 
     match unsafe { (*tcp_hdr).dest } {
         PORT => {
-            if unsafe { *tcp_hdr }.rst() != 0  { // RST bit is set, dropping the packet
+            if unsafe { *tcp_hdr }.rst() != 0 || unsafe { *tcp_hdr }.ack() != 0 { // RST bit is set, dropping the packet
                 Ok(xdp_action::XDP_DROP)
             } else {
                 // save the fact that we got a packet from the host
@@ -57,12 +57,11 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
                     // ethernet
                     core::mem::swap(&mut (*eth_hdr).src_addr, &mut (*eth_hdr).dst_addr);
 
-
                     // ip
                     core::mem::swap(&mut (*ip_hdr).src_addr, &mut (*ip_hdr).dst_addr); 
                     (*ip_hdr).ttl = 0xFF;
                     // unimplemented!(); // checksum
-                    
+                
                     // tcp
                     core::mem::swap(&mut (*tcp_hdr).source, &mut (*tcp_hdr).dest);
                     // new_seq = ack
@@ -72,9 +71,7 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
                     // unimplemented!(); // checksum
                     (*tcp_hdr).set_syn(0);
                     (*tcp_hdr).set_rst(1);
-
                 }
-
 
                 Ok(xdp_action::XDP_TX)
             }

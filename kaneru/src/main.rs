@@ -73,7 +73,7 @@ fn main() -> Result<(), anyhow::Error> {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
     };
-    let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
+    let _ = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
     // if ret != 0 {
         // debug!("remove limit on locked memory failed, ret is: {}", ret);
     // }
@@ -121,7 +121,7 @@ fn main() -> Result<(), anyhow::Error> {
         .expect("couldn't find interface");
     let sock = Socket::with_shared(&iface, &umem)
         .expect("couldn't create xsk");
-    let mut fq_cq = umem.fq_cq(&sock)
+    let fq_cq = umem.fq_cq(&sock)
         .expect("couldn't map fill and completion queues"); // Fill Queue / Completion Queue
 
     let cfg = SocketConfig {
@@ -131,7 +131,7 @@ fn main() -> Result<(), anyhow::Error> {
     };
     let rxtx = umem.rx_tx(&sock, &cfg)
         .expect("couldn't map rx and tx queues"); // RX + TX Queues
-    let mut tx = rxtx.map_tx()
+    let tx = rxtx.map_tx()
         .expect("couldn't map tx queue");
     
     umem.bind(&rxtx)
@@ -160,7 +160,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     // println!("{:?}", args.lhosts.list);
 
-    h.join();
+    let _= h.join();
 
     Ok(())
 }
@@ -201,12 +201,26 @@ fn finalize_buffer(addr: u64, host: &SocketAddrV4) {
         // dst ip
         fr[30..34].copy_from_slice(&ip.to_bits().to_be_bytes());
         // ip checksum
-        // TBD
+        set_ip_chksum(&mut fr[14..34]);
         // dst tcp port
-        fr[36..38].copy_from_slice(&port.to_be_bytes()); // to_bytes, or to_be_bytes, that is the question...
+        fr[36..38].copy_from_slice(&port.to_be_bytes());
         // tcp checksum
         // TBD
+        // println!("{:?}", fr);
     }
+}
+
+#[inline(always)]
+unsafe fn set_ip_chksum(header: &mut [u8]) {
+    let mut sum = 0u32;
+    for cur in header.chunks_exact(2) { // thankfully, in our case the ip header has even length
+        sum += u16::from_le_bytes([cur[0], cur[1]]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let sum = !(sum as u16);
+    header[10..12].copy_from_slice(&sum.to_le_bytes());
 }
 
 #[inline(always)]
@@ -218,7 +232,6 @@ fn send(umem: &mut Umem, mut tx: RingTx, mut fq_cq: DeviceQueue, hosts: &mut Hos
         while let Some(offset) = buffers.pop() { // enqueue tx
             if let Some(host) = host_iter.next() {
                 finalize_buffer(offset, host);
-                // let tx_frame = umem.frame(BufIdx(idx)).unwrap();
                 {
                     let mut writer = tx.transmit(1);
                     writer.insert_once(XdpDesc { 
@@ -244,18 +257,6 @@ fn send(umem: &mut Umem, mut tx: RingTx, mut fq_cq: DeviceQueue, hosts: &mut Hos
             reader.release();
         }
     }
-    
-    // for host in hosts.rand_iter() {
-    //     if let Some(idx) = buffers.pop() { // enqueue transmissions
-           
-    //         finalize_buffer(&mut Umem, idk, host);
-    //                 } else { // dequeue completions
-    //         let mut reader = device.complete(1);
-    //         loop { // we will block here just in case
-    //             reader.read();
-    //         }
-    //     }
-    // }
 }
 
 static SYN_PACKET: [u8; 54] = [
@@ -267,13 +268,13 @@ static SYN_PACKET: [u8; 54] = [
     // IP : [14..34]
     0x45, 0x00, 0x00, 0x28, // version etc 
     0x00, 0x01, 0x00, 0x00, // more irrelevant stuff
-    0xff, 0x06, // ttl, protocol
+    0x40, 0x06, // ttl, protocol
     0x00, 0x00, // [checksum] : [24..26]
     0, 0, 0, 0, // (src ip) : [26..30]
     0, 0, 0, 0, // [dst ip] : [30..34]
 
     // TCP [34..54]
-    0x05, 0x39, // source port known statically as 1337 (this is required for the ebpf program to know which packets are directed to the scanner)
+    0x05, 0x39, // source port known statically as 1337 (this is required for the ebpf program to know which packets are to be directed to the scanner)
     0x00, 0x00, // [dst port] : [36..38]
     0x00, 0x00, 0x00, 0x00, // sequence number
     0x00, 0x00, 0x00, 0x00, // acknowledgment number
