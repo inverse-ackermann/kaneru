@@ -46,34 +46,35 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
 
     match unsafe { (*tcp_hdr).dest } {
         PORT => {
-            if unsafe { *tcp_hdr }.rst() != 0 || unsafe { *tcp_hdr }.ack() != 0 { // RST bit is set, dropping the packet
+            if unsafe { *tcp_hdr }.rst() != 0 { // RST bit is set, dropping the packet
                 Ok(xdp_action::XDP_DROP)
             } else {
-                // save the fact that we got a packet from the host
                 unsafe { RESPONSES.push(&((*ip_hdr).src_addr, (*tcp_hdr).source), 0) }.map_err(|_| ())?;
+                Ok(xdp_action::XDP_PASS)
+                // // save the fact that we got a packet from the host
 
-                // modify the packet in place and resend it
-                unsafe { 
-                    // ethernet
-                    core::mem::swap(&mut (*eth_hdr).src_addr, &mut (*eth_hdr).dst_addr);
+                // // modify the packet in place and resend it
+                // unsafe { 
+                //     // ethernet
+                //     core::mem::swap(&mut (*eth_hdr).src_addr, &mut (*eth_hdr).dst_addr);
 
-                    // ip
-                    core::mem::swap(&mut (*ip_hdr).src_addr, &mut (*ip_hdr).dst_addr); 
-                    (*ip_hdr).ttl = 0xFF;
-                    // unimplemented!(); // checksum
+                //     // ip
+                //     core::mem::swap(&mut (*ip_hdr).src_addr, &mut (*ip_hdr).dst_addr); 
+                //     (*ip_hdr).ttl = 0xFF;
+                //     // unimplemented!(); // checksum
                 
-                    // tcp
-                    core::mem::swap(&mut (*tcp_hdr).source, &mut (*tcp_hdr).dest);
-                    // new_seq = ack
-                    // new_ack = seq + 1
-                    core::mem::swap(&mut (*tcp_hdr).seq, &mut (*tcp_hdr).ack_seq);
-                    (*tcp_hdr).ack_seq = (u32::from_be((*tcp_hdr).ack_seq) + 1).to_be();
-                    // unimplemented!(); // checksum
-                    (*tcp_hdr).set_syn(0);
-                    (*tcp_hdr).set_rst(1);
-                }
+                //     // tcp
+                //     core::mem::swap(&mut (*tcp_hdr).source, &mut (*tcp_hdr).dest);
+                //     // new_seq = ack
+                //     // new_ack = seq + 1
+                //     core::mem::swap(&mut (*tcp_hdr).seq, &mut (*tcp_hdr).ack_seq);
+                //     (*tcp_hdr).ack_seq = (u32::from_be((*tcp_hdr).ack_seq) + 1).to_be();
+                //     // unimplemented!(); // checksum
+                //     (*tcp_hdr).set_syn(0);
+                //     (*tcp_hdr).set_rst(1);
+                // }
 
-                Ok(xdp_action::XDP_TX)
+                // Ok(xdp_action::XDP_TX)
             }
         },
         _ => Ok(xdp_action::XDP_PASS),

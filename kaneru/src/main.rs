@@ -127,7 +127,7 @@ fn main() -> Result<(), anyhow::Error> {
     let cfg = SocketConfig {
         rx_size: None,
         tx_size: NonZeroU32::new(1 << 10),
-        bind_flags: SocketConfig::XDP_BIND_ZEROCOPY | SocketConfig::XDP_BIND_NEED_WAKEUP,
+        bind_flags: SocketConfig::XDP_BIND_ZEROCOPY  | SocketConfig::XDP_BIND_NEED_WAKEUP,
     };
     let rxtx = umem.rx_tx(&sock, &cfg)
         .expect("couldn't map rx and tx queues"); // RX + TX Queues
@@ -139,13 +139,12 @@ fn main() -> Result<(), anyhow::Error> {
 
     // THIS CONCLUDES THE SETUP (almost)
 
-
     let h = thread::spawn(move || {
         for _ in 0..100 {
             loop {
                 match responses.pop(0) {
                     Ok(res) => {
-                        println!("SYN-ACK FROM {}:{}", res.0.0, u16::from_be(res.0.1)); 
+                        println!("SYN-ACK FROM {:?}:{}", Ipv4Addr::from_bits(res.0.0.to_be()), u16::from_be(res.0.1)); 
                         break;
                     }, 
                     _ => {},
@@ -157,8 +156,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     prepare_buffers(&mut umem, 10, &args.iface);
     send(&mut umem, tx, fq_cq, &mut args.lhosts);
-
-    // println!("{:?}", args.lhosts.list);
+    println!("done with sending packets");
 
     let _= h.join();
 
@@ -205,17 +203,21 @@ fn finalize_buffer(addr: u64, host: &SocketAddrV4) {
         // dst tcp port
         fr[36..38].copy_from_slice(&port.to_be_bytes());
         // tcp checksum
-        // TBD
+        set_tcp_chksum(&mut fr[14..54]);
         // println!("{:?}", fr);
     }
 }
 
 #[inline(always)]
-unsafe fn set_ip_chksum(header: &mut [u8]) {
+fn set_ip_chksum(header: &mut [u8]) {
     let mut sum = 0u32;
-    for cur in header.chunks_exact(2) { // thankfully, in our case the ip header has even length
-        sum += u16::from_le_bytes([cur[0], cur[1]]) as u32;
+    for i in 0..5 { // thankfully, in our case the ip header has even length
+        sum += u16::from_le_bytes([header[2 * i], header[2 * i + 1]]) as u32;
     }
+    for i in 6..10 { 
+        sum += u16::from_le_bytes([header[2 * i], header[2 * i + 1]]) as u32;
+    }
+
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
@@ -223,23 +225,58 @@ unsafe fn set_ip_chksum(header: &mut [u8]) {
     header[10..12].copy_from_slice(&sum.to_le_bytes());
 }
 
+// TODO: rewrite. this is horrible
+#[inline(always)]
+fn set_tcp_chksum(header: &mut [u8], ) {
+    let mut ps_header: [u8; 12] = [0; 12];
+    ps_header[0..8].copy_from_slice(&header[12..20]);
+    ps_header[9] = 0x06;
+    ps_header[11] = 20;
+    
+    let mut sum = 0u32;
+    for i in 0..6 {
+        sum += u16::from_le_bytes([ps_header[2 * i], ps_header[2 * i + 1]]) as u32;
+    }
+    for i in 0..8 {
+        sum += u16::from_le_bytes([header[20 + 2 * i], header[21 + 2 * i]]) as u32;
+    } // ignore the previous checksum field
+    for i in 9..10 {
+        sum += u16::from_le_bytes([header[20 + 2 * i], header[21 + 2 * i]]) as u32;
+    }
+
+     
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    
+    let sum = !(sum as u16);
+    header[36..38].copy_from_slice(&sum.to_le_bytes());
+}
+
 #[inline(always)]
 fn send(umem: &mut Umem, mut tx: RingTx, mut fq_cq: DeviceQueue, hosts: &mut Hosts) {
-    let mut buffers: Vec<u64> = (0..10).map(|idx| umem.frame(BufIdx(idx)).unwrap().addr.as_ptr() as *const u8 as u64).collect();
+    let _base = umem.frame(BufIdx(0)).unwrap().addr.as_ptr() as *const u8 as u64;
+    let mut buffers: Vec<u64> = (0..10).map(|idx| umem.frame(BufIdx(idx)).unwrap().addr.as_ptr() as *const u8 as u64 - _base).collect();
     let mut host_iter = hosts.rand_iter();
+    // having to to pointer arithmetic is very unfortunate, 
+    // but we need the __offset__ of a frame to submit it to the tx queue,
+    // while the completion queue only returns its __address__ (which we also need to write to it before sending)
 
+    let mut n = 0u32;
+    
     'm: loop {
-        while let Some(offset) = buffers.pop() { // enqueue tx
+        while let Some(addr) = buffers.pop() { // enqueue tx
             if let Some(host) = host_iter.next() {
-                finalize_buffer(offset, host);
+                finalize_buffer(addr + _base, host);
                 {
                     let mut writer = tx.transmit(1);
                     writer.insert_once(XdpDesc { 
-                        addr: offset,
+                        addr: addr,
                         len: 54,
                         options: 0,
                     });
                     writer.commit();
+                    n += 1;
                 }
                 if tx.needs_wakeup() {
                     tx.wake();
@@ -248,15 +285,18 @@ fn send(umem: &mut Umem, mut tx: RingTx, mut fq_cq: DeviceQueue, hosts: &mut Hos
                 break 'm;
             }
         }
+
+        // println!("{:?}", n);
             
         { // dequeue completions
             let mut reader = fq_cq.complete(fq_cq.available());
-            while let Some(offset) = reader.read() {
-                buffers.push(offset);
+            while let Some(addr) = reader.read() {
+                buffers.push(addr);
             }
             reader.release();
         }
     }
+
 }
 
 static SYN_PACKET: [u8; 54] = [
@@ -268,7 +308,7 @@ static SYN_PACKET: [u8; 54] = [
     // IP : [14..34]
     0x45, 0x00, 0x00, 0x28, // version etc 
     0x00, 0x01, 0x00, 0x00, // more irrelevant stuff
-    0x40, 0x06, // ttl, protocol
+    0xFF, 0x06, // ttl, protocol
     0x00, 0x00, // [checksum] : [24..26]
     0, 0, 0, 0, // (src ip) : [26..30]
     0, 0, 0, 0, // [dst ip] : [30..34]
