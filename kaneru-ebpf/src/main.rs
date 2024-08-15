@@ -46,9 +46,10 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
 
     match unsafe { (*tcp_hdr).dest } {
         PORT => {
-            if unsafe { *tcp_hdr }.rst() != 0 { // RST bit is set, dropping the packet
+            if unsafe { *tcp_hdr }.rst() != 0 { // RST bit is set, drop the packet
                 Ok(xdp_action::XDP_DROP)
             } else {
+                // for now we will let the kernel handle sending RSTs
                 unsafe { RESPONSES.push(&((*ip_hdr).src_addr, (*tcp_hdr).source), 0) }.map_err(|_| ())?;
                 Ok(xdp_action::XDP_PASS)
                 // // save the fact that we got a packet from the host

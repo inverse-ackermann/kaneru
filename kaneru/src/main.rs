@@ -34,7 +34,6 @@ use xdpilone::{
     xdp::XdpDesc,
 };
 
-use netdev;
 use rand::{thread_rng, seq::SliceRandom};
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -55,16 +54,6 @@ struct Args {
     frame_size: u32,
 }
 
-
-// tx -(kernel)-> complete
-// /\              /
-//  \             /
-//   \           /
-//    \         /
-//     \       /
-// 	    \     / 
-// 	     \   \/
-// 	      queue
 
 fn main() -> Result<(), anyhow::Error> {
     let mut args = <Args as Parser>::parse();
@@ -104,13 +93,13 @@ fn main() -> Result<(), anyhow::Error> {
     };
     
     let umem_size: usize = args.umem_size;
-    let layout = Layout::from_size_align(umem_size, 16384).unwrap(); // page aligned
+    let layout = Layout::from_size_align(umem_size, 16384).unwrap(); // page aligned, even on apple cpus
     let ptr = unsafe { NonNull::slice_from_raw_parts(NonNull::new_unchecked(alloc(layout)), umem_size) };
 
 
     // xdpilone crate author didn't bother to 
     // implement std::error::Error for Errno,
-    // so we have to catch it manually
+    // so we have to catch it manually every time
     let mut umem: Umem = {
         unsafe { Umem::new(config, ptr).expect("umem creation error") }
     };
@@ -126,7 +115,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     let cfg = SocketConfig {
         rx_size: None,
-        tx_size: NonZeroU32::new(1 << 10),
+        tx_size: NonZeroU32::new(args.tx_size),
         bind_flags: SocketConfig::XDP_BIND_ZEROCOPY  | SocketConfig::XDP_BIND_NEED_WAKEUP,
     };
     let rxtx = umem.rx_tx(&sock, &cfg)
@@ -137,27 +126,24 @@ fn main() -> Result<(), anyhow::Error> {
     umem.bind(&rxtx)
         .expect("couldn't bind xsk");
 
-    // THIS CONCLUDES THE SETUP (almost)
-
     let h = thread::spawn(move || {
         for _ in 0..100 {
             loop {
-                match responses.pop(0) {
-                    Ok(res) => {
-                        println!("SYN-ACK FROM {:?}:{}", Ipv4Addr::from_bits(res.0.0.to_be()), u16::from_be(res.0.1)); 
-                        break;
-                    }, 
-                    _ => {},
+                if let Ok(res) = responses.pop(0) {
+                    println!("SYN-ACK FROM {:?}:{}", Ipv4Addr::from_bits(res.0.0.to_be()), u16::from_be(res.0.1)); 
+                    break;
                 };
             } 
         }
     });
 
+    let length: u32 = umem_size as u32 / args.frame_size;
 
-    prepare_buffers(&mut umem, 10, &args.iface);
-    send(&mut umem, tx, fq_cq, &mut args.lhosts);
-    println!("done with sending packets");
+    prepare_buffers(&mut umem, length, &args.iface);
+    send(&mut umem, length, tx, fq_cq, &mut args.lhosts);
+    eprintln!("done sending packets");
 
+    // wait for a bit and then kill the child thread
     let _= h.join();
 
     Ok(())
@@ -171,7 +157,7 @@ unsafe impl Pod for IpPort {} // clearly, it is safe to transmute this from byte
 fn prepare_buffers(umem: &mut Umem, len: u32, interface: &str) {
     let iface = netdev::get_interfaces().into_iter()
         .find(|i| {i.name == interface}).unwrap();
-    let gateway = iface.gateway.unwrap();
+    let gateway = iface.gateway.unwrap(); // this will fail if you try to run it on, say, loopback
 
     // we fill out all of the fields that coincide for all packets
     for i in 0..len {
@@ -185,7 +171,7 @@ fn prepare_buffers(umem: &mut Umem, len: u32, interface: &str) {
             // src mac
             fr[6..12].copy_from_slice(&iface.mac_addr.unwrap().octets());
             // src ip
-            fr[26..30].copy_from_slice(&iface.ipv4.get(0).unwrap().addr.octets());
+            fr[26..30].copy_from_slice(&iface.ipv4.first().unwrap().addr.octets());
         }
     }
 }
@@ -211,7 +197,10 @@ fn finalize_buffer(addr: u64, host: &SocketAddrV4) {
 #[inline(always)]
 fn set_ip_chksum(header: &mut [u8]) {
     let mut sum = 0u32;
-    for i in 0..5 { // thankfully, in our case the ip header has even length
+    // according to the disassembly, without this the unrolled loops end up as ten billion bounds checks, which just looks ugly
+    // and I don't really want to write get_unchecked() everywhere either
+    assert!(header.len() >= 20); // obviously, this never fails (we know the header length statically)
+    for i in 0..5 {
         sum += u16::from_le_bytes([header[2 * i], header[2 * i + 1]]) as u32;
     }
     for i in 6..10 { 
@@ -225,9 +214,9 @@ fn set_ip_chksum(header: &mut [u8]) {
     header[10..12].copy_from_slice(&sum.to_le_bytes());
 }
 
-// TODO: rewrite. this is horrible
+// TODO: rewrite. this is horrible (but actually the pseudoheader part compiles into decent code? maybe I should leave it like this.)
 #[inline(always)]
-fn set_tcp_chksum(header: &mut [u8], ) {
+fn set_tcp_chksum(header: &mut [u8]) {
     let mut ps_header: [u8; 12] = [0; 12];
     ps_header[0..8].copy_from_slice(&header[12..20]);
     ps_header[9] = 0x06;
@@ -237,6 +226,7 @@ fn set_tcp_chksum(header: &mut [u8], ) {
     for i in 0..6 {
         sum += u16::from_le_bytes([ps_header[2 * i], ps_header[2 * i + 1]]) as u32;
     }
+    assert!(header.len() >= 40); 
     for i in 0..8 {
         sum += u16::from_le_bytes([header[20 + 2 * i], header[21 + 2 * i]]) as u32;
     } // ignore the previous checksum field
@@ -253,30 +243,42 @@ fn set_tcp_chksum(header: &mut [u8], ) {
     header[36..38].copy_from_slice(&sum.to_le_bytes());
 }
 
-#[inline(always)]
-fn send(umem: &mut Umem, mut tx: RingTx, mut fq_cq: DeviceQueue, hosts: &mut Hosts) {
-    let _base = umem.frame(BufIdx(0)).unwrap().addr.as_ptr() as *const u8 as u64;
-    let mut buffers: Vec<u64> = (0..10).map(|idx| umem.frame(BufIdx(idx)).unwrap().addr.as_ptr() as *const u8 as u64 - _base).collect();
-    let mut host_iter = hosts.rand_iter();
-    // having to to pointer arithmetic is very unfortunate, 
-    // but we need the __offset__ of a frame to submit it to the tx queue,
-    // while the completion queue only returns its __address__ (which we also need to write to it before sending)
 
-    let mut n = 0u32;
+// tx -(kernel)-> complete
+// /\              /
+//  \             /
+//   \           /
+//    \         /
+//     \       /
+// 	    \     / 
+// 	     \   \/
+// 	    buffers
+
+#[inline(always)]
+fn send(umem: &mut Umem, len: u32, mut tx: RingTx, mut fq_cq: DeviceQueue, hosts: &mut Hosts) {
+    let base = umem.frame(BufIdx(0)).unwrap().addr.as_ptr() as *const u8 as u64;
+    let mut buffers: Vec<u64> = (0..len).map(|idx| umem.frame(BufIdx(idx)).unwrap().addr.as_ptr() as *const u8 as u64 - base).collect();
+    let mut host_iter = hosts.rand_iter();
     
-    'm: loop {
+    // having to to pointer arithmetic is very unfortunate, 
+    // but both the tx and comp queues only consume and produce, respectively, the __offset__ of the frame
+    // while we need its __address__ in order to write data to the buffer
+    
+    'm: loop { 
         while let Some(addr) = buffers.pop() { // enqueue tx
+            // there is most likely some performance left on the table here, since we don't really batch transmissions
+            // but profiling (at least on my fairly slow wi-fi nic) shows 
+            // that the majority of the runtime is spent dequeueing, so this is probably okay for now
             if let Some(host) = host_iter.next() {
-                finalize_buffer(addr + _base, host);
+                finalize_buffer(addr + base, host);
                 {
-                    let mut writer = tx.transmit(1);
+                    let mut writer = tx.transmit(1); 
                     writer.insert_once(XdpDesc { 
-                        addr: addr,
+                        addr,
                         len: 54,
                         options: 0,
                     });
                     writer.commit();
-                    n += 1;
                 }
                 if tx.needs_wakeup() {
                     tx.wake();
@@ -286,8 +288,6 @@ fn send(umem: &mut Umem, mut tx: RingTx, mut fq_cq: DeviceQueue, hosts: &mut Hos
             }
         }
 
-        // println!("{:?}", n);
-            
         { // dequeue completions
             let mut reader = fq_cq.complete(fq_cq.available());
             while let Some(addr) = reader.read() {
@@ -296,7 +296,6 @@ fn send(umem: &mut Umem, mut tx: RingTx, mut fq_cq: DeviceQueue, hosts: &mut Hos
             reader.release();
         }
     }
-
 }
 
 static SYN_PACKET: [u8; 54] = [
@@ -387,7 +386,7 @@ impl FromStr for Hosts {
         }
 
         Ok(Self {
-            list: list,
+            list,
         })
     }
 }

@@ -1,3 +1,4 @@
+cargo-features = ["codegen-backend"]
 [package]
 name = "kaneru"
 version = "0.1.0"
@@ -9,7 +10,6 @@ aya = "0.12"
 clap = { version = "4.1", features = ["derive"] }
 anyhow = "1"
 libc = "0.2"
-log = "0.4"
 xdpilone = "1.0.4"
 netdev = "0.30.0"
 rand = "0.8.5"
@@ -17,3 +17,12 @@ rand = "0.8.5"
 [[bin]]
 name = "kaneru"
 path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+debug = 0
+codegen-backend = "cranelift"

@@ -1,0 +1,9 @@
+[toolchain]
+channel = "nightly"
+
+components = [
+    "cargo",
+    "rustc",
+    "rustc-codegen-cranelift-preview",
+]
+
